@@ -32,8 +32,14 @@ class RasterHandler(QObject):
         self.bands_range = range(1, self.bands_nr + 1)
         self.active_bands = [1]
         self.project = QgsProject.instance()
-        self.crs_transform = None if self.project.crs() == self.layer.crs() else \
-            QgsCoordinateTransform(self.project.crs(), self.layer.crs(), self.project)
+        if self.project is not None and self.project.crs() != self.layer.crs():
+            self.crs_transform = QgsCoordinateTransform(
+                self.project.crs(),
+                self.layer.crs(),
+                self.project,
+            )
+        else:
+            self.crs_transform = None
         self.data_types = None
         self.nodata_values = None
         self.pixel_size_x = self.layer.rasterUnitsPerPixelX()
@@ -106,7 +112,10 @@ class RasterHandler(QObject):
         if self.logger:
             self.logger.debug(f"Selecting cells for geometries: {[g.asWkt() for g in geometries]}")
         if not geometries:
-            self.uc.bar_warn("Select some raster cells!")
+            if self.uc:
+                self.uc.bar_warn("Select some raster cells!")
+            elif self.logger:
+                self.logger.warning("Select some raster cells!")
             return
         self.selecting_geoms = dict()
         self.selected_cells = []
@@ -135,6 +144,21 @@ class RasterHandler(QObject):
             self.selecting_geoms[nr] = sgeom
             self.spatial_index.addFeature(nr, sgeom.boundingBox())
             geoms.append(sgeom)
+
+        if not geoms:
+            # Durante il disegno interattivo del poligono il map tool può inviare
+            # una geometria temporanea ancora non valida/chiusa. In quel caso
+            # evitiamo warning prematuri e usciamo in silenzio.
+            if transform:
+                 return
+
+            msg = "Selected geometry is invalid"
+            if self.uc:
+                self.uc.bar_warn(msg)
+            elif self.logger:
+                self.logger.warning(msg)
+            return
+
         self.total_geometry = QgsGeometry.unaryUnion(geoms)
         if self.logger:
             self.logger.debug(f"Total selecting geometry bbox: {self.total_geometry.boundingBox()}")
@@ -159,6 +183,7 @@ class RasterHandler(QObject):
                     if g.intersects(bbox):
                         self.selected_cells.append((row, col))
                         self.cell_centers[(row, col)] = (pt_x, pt_y)
+                        break
         if self.logger:
             self.logger.debug(f"Nr of cells selected: {len(self.selected_cells)}")
 
@@ -167,7 +192,25 @@ class RasterHandler(QObject):
         crs_str = self.layer.crs().authid().lower()
         fields_def = "field=row:int&field=col:int"
         self.cell_pts_layer = QgsVectorLayer(f"Point?crs={crs_str}&{fields_def}", "Temp raster cell points", "memory")
-        fields = self.cell_pts_layer.dataProvider().fields()
+        
+        cell_pts_layer = self.cell_pts_layer
+        if cell_pts_layer is None:
+            if self.logger:
+                self.logger.warning("Failed to create memory point layer")
+            return
+        
+        provider = cell_pts_layer.dataProvider()
+        
+        if provider is None:
+            if self.logger:
+                self.logger.warning("Failed to get memory layer data provider")
+            return
+        
+        if not self.cell_centers:
+            self.selected_cells_feats = {}
+            return
+
+        fields = provider.fields()
         feats = []
         for row_col, xy in self.cell_centers.items():
             row, col = row_col
@@ -177,10 +220,15 @@ class RasterHandler(QObject):
             feat["row"] = row
             feat["col"] = col
             feats.append(feat)
-        self.cell_pts_layer.dataProvider().addFeatures(feats)
-        self.selected_cells_feats = dict()  # {(row, cell): feat}
-        for feat in self.cell_pts_layer.getFeatures():
+            
+        provider.addFeatures(feats)
+
+        self.selected_cells_feats = {} # {(row, cell): feat}
+        features = cell_pts_layer.getFeatures()
+        feat = QgsFeature()
+        while features.nextFeature(feat):
             self.selected_cells_feats[(feat["row"], feat["col"])] = feat.id()
+            feat = QgsFeature()
 
     def write_block(self, const_values=None, low_pass_filter=False):
         """
@@ -200,9 +248,25 @@ class RasterHandler(QObject):
                 return None
         if self.logger:
             self.logger.debug("Calculating block origin coordinates...")
-        b_orig_x, b_orig_y = self.index_to_point(self.block_row_min, self.block_col_min)
-        cols = self.block_col_max - self.block_col_min + 1
-        rows = self.block_row_max - self.block_row_min + 1
+        
+        if (
+            self.block_row_min is None
+            or self.block_row_max is None
+            or self.block_col_min is None
+            or self.block_col_max is None
+        ):
+            if self.logger:
+                self.logger.warning("Block indices are not initialized")
+            return None
+        
+        row_min = self.block_row_min
+        row_max = self.block_row_max
+        col_min = self.block_col_min
+        col_max = self.block_col_max
+
+        b_orig_x, b_orig_y = self.index_to_point(row_min, col_min)
+        cols = col_max - col_min + 1
+        rows = row_max - row_min + 1
         b_end_x = b_orig_x + cols * self.pixel_size_x
         b_end_y = b_orig_y - rows * self.pixel_size_y
         block_bbox = QgsRectangle(b_orig_x, b_end_y, b_end_x, b_orig_y)
@@ -212,46 +276,97 @@ class RasterHandler(QObject):
         old_blocks = []
         new_blocks = []
         cell_values = dict()
+        
         if const_values is None and not low_pass_filter:
-            for feat in self.cell_pts_layer.getFeatures():
+            cell_pts_layer = self.cell_pts_layer
+            if cell_pts_layer is None:
+                if self.logger:
+                    self.logger.warning("Cell points layer is not available")
+                return None
+                
+            features = cell_pts_layer.getFeatures()
+            feat = QgsFeature()
+            while features.nextFeature(feat):
                 cell_values[feat.id()] = feat.attribute(self.exp_field_idx)
+                feat = QgsFeature()
+        
+        selected_cells = self.selected_cells
+        if not selected_cells:
+            if self.logger:
+                self.logger.warning("No selected cells available")
+            return None
+
+        selected_cells_feats = self.selected_cells_feats if const_values is None and not low_pass_filter else None
+        if const_values is None and not low_pass_filter and selected_cells_feats is None:
+            if self.logger:
+                self.logger.warning("Selected cell feature map is not available")
+            return None
+        
+        expression_selected_cells_feats = selected_cells_feats if selected_cells_feats is not None else {}
+
+        nodata_values = self.nodata_values
+        if nodata_values is None:
+            if self.logger:
+                self.logger.warning("NODATA values are not available")
+            return None
+
+        data_types = self.data_types
+        if data_types is None:
+            if self.logger:
+                self.logger.warning("Raster data types are not available")
+            return None
+
         for band_nr in self.active_bands:
             block = self.provider.block(band_nr, block_bbox, cols, rows)
             new_blocks.append(block)
             block_data = block.data().data()
-            old_block = QgsRasterBlock(self.data_types[band_nr - 1], cols, rows)
+            old_block = QgsRasterBlock(data_types[band_nr - 1], cols, rows)
             old_block.setData(block_data)
-            for abs_row, abs_col in self.selected_cells:
-                row = abs_row - self.block_row_min
-                col = abs_col - self.block_col_min
+
+            row_min = self.block_row_min
+            col_min = self.block_col_min
+            if row_min is None or col_min is None:
+                if self.logger:
+                    self.logger.warning("Block indices are not initialized")
+                return None
+
+            for abs_row, abs_col in selected_cells:
+                row = abs_row - row_min
+                col = abs_col - col_min
+
                 if const_values:
                     idx = band_nr - 1 if len(self.active_bands) > 1 else 0
                     new_val = const_values[idx]
+
                 elif low_pass_filter:
                     # the filter is applied for cells inside the block only
                     if block.height() < 3 or block.width() < 3:
                         # the selected block is too small for filtering -> keep the old value
                         new_val = None
                     else:
-                        new_val = low_pass_filtered(old_block, row, col, self.nodata_values[band_nr - 1])
+                        new_val = low_pass_filtered(old_block, row, col, nodata_values[band_nr - 1])
                 else:
                     # set the expression value
-                    feat_id = self.selected_cells_feats[(abs_row, abs_col)]
-                    if cell_values[feat_id] is not None:
-                        new_val = None if math.isnan(cell_values[feat_id]) or \
-                                      cell_values[feat_id] is None else cell_values[feat_id]
-                    else:
+                    feat_id = expression_selected_cells_feats[(abs_row, abs_col)]
+                    expr_val = cell_values.get(feat_id)
+                    if expr_val is None:
                         new_val = None
+                    else:
+                        new_val = None if math.isnan(expr_val) else expr_val
                 new_val = old_block.value(row, col) if new_val is None else new_val
                 set_res = block.setValue(row, col, new_val)
+
                 if self.logger:
                     self.logger.debug(f"Setting block value for band {band_nr}, row {row}, col: {col}: {set_res}")
+                         
             old_blocks.append(old_block)
-            band_res = self.provider.writeBlock(block, band_nr, self.block_col_min, self.block_row_min)
+            band_res = self.provider.writeBlock(block, band_nr, col_min, row_min)
+
             if self.logger:
                 self.logger.debug(f"Writing block for band {band_nr}: {band_res}")
+
         self.provider.setEditable(False)
-        change = RasterChange(self.active_bands, self.block_row_min, self.block_col_min, old_blocks, new_blocks)
+        change = RasterChange(self.active_bands, row_min, col_min, old_blocks, new_blocks)
         self.raster_changed.emit(change)
         return True
 
@@ -260,7 +375,7 @@ class RasterHandler(QObject):
         if self.logger:
             self.logger.debug(f"Writing blocks from undo")
         if not self.provider.isEditable():
-            res = self.provider.setEditable(True)
+            self.provider.setEditable(True)
         bands, row_min, col_min, blocks = data
         for band_nr in bands:
             idx = band_nr - 1 if len(bands) > 1 else 0

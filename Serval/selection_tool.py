@@ -28,14 +28,14 @@ class RasterCellSelectionMapTool(QgsMapTool):
         self.setCursor(QCursor(QPixmap(icon_path('select_tool.svg')), hotX=0, hotY=0))
         self.current_rubber_band = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
         self.selected_rubber_band = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
-        self.current_points = None
-        self.selected_geometries = None
+        self.current_points = []
+        self.selected_geometries = []
         self.last_pos = None
         self.sel_line_width = 1
-        self.cur_sel_color = QColor(Qt.yellow)
-        self.cur_sel_fill_color = QColor(Qt.yellow)
-        self.sel_color = QColor(Qt.yellow)
-        self.sel_fill_color = QColor(Qt.yellow)
+        self.cur_sel_color = QColor(Qt.GlobalColor.yellow)
+        self.cur_sel_fill_color = QColor(Qt.GlobalColor.yellow)
+        self.sel_color = QColor(Qt.GlobalColor.yellow)
+        self.sel_fill_color = QColor(Qt.GlobalColor.yellow)
         self.prev_tool = None
         self.selection_mode = None
         self.logger = get_logger() if debug else None
@@ -48,11 +48,11 @@ class RasterCellSelectionMapTool(QgsMapTool):
         self.mode = mode
         self.sel_line_width = line_width
         self.geom_type = QgsWkbTypes.LineGeometry if mode == self.LINE_SELECTION else QgsWkbTypes.PolygonGeometry
-        self.cur_sel_color = Qt.yellow
-        self.cur_sel_fill_color = QColor(Qt.yellow)
+        self.cur_sel_color = QColor(Qt.GlobalColor.yellow)
+        self.cur_sel_fill_color = QColor(Qt.GlobalColor.yellow)
         self.cur_sel_fill_color.setAlpha(20)
-        self.sel_color = Qt.yellow
-        self.sel_fill_color = QColor(Qt.yellow)
+        self.sel_color = QColor(Qt.GlobalColor.yellow)
+        self.sel_fill_color = QColor(Qt.GlobalColor.yellow)
         self.sel_fill_color.setAlpha(20)
         return True
 
@@ -75,8 +75,8 @@ class RasterCellSelectionMapTool(QgsMapTool):
         self.current_rubber_reset()
         self.selected_rubber_reset()
         self.raster = None
-        self.current_points = None
-        self.selected_geometries = None
+        self.current_points = []
+        self.selected_geometries = []
 
     def selecting_finished(self):
         if self.logger:
@@ -106,17 +106,18 @@ class RasterCellSelectionMapTool(QgsMapTool):
     def clear_all_selections(self):
         self.current_selection_reset()
         self.selected_rubber_reset()
-        self.selected_geometries = None
+        self.selected_geometries = []
 
     def create_selecting_geometry(self, cur_position=None):
+        points = self.current_points if self.current_points is not None else []
         pt = [cur_position] if cur_position else []
         if self.geom_type == QgsWkbTypes.LineGeometry:
-            geom = QgsGeometry.fromPolylineXY(self.current_points + pt).buffer(self.sel_line_width / 2., 5)
+            geom = QgsGeometry.fromPolylineXY(points + pt).buffer(self.sel_line_width / 2.0, 5)
         else:
-            if len(self.current_points) < 2:
-                geom = QgsGeometry.fromPolylineXY(self.current_points + pt)
+            if len(points) < 2:
+                geom = QgsGeometry.fromPolylineXY(points + pt)
             else:
-                poly_pts = [self.current_points + pt]
+                poly_pts = [points + pt]
                 geom = QgsGeometry.fromPolygonXY(poly_pts)
         return geom
 
@@ -129,36 +130,45 @@ class RasterCellSelectionMapTool(QgsMapTool):
         if geom.isGeosValid():
             self.uc.clear_bar_messages()
         else:
+            # In modalità poligono i primi punti producono una geometria temporanea
+            # ancora non chiusa/non valida: evitiamo warning prematuri.
+            if self.geom_type == QgsWkbTypes.PolygonGeometry and len(self.current_points) <= 2:
+                return
             self.uc.bar_warn("Selected geometry is invalid")
 
     def selected_rubber_update(self):
         self.selected_rubber_reset()
-        if self.selected_geometries is None:
+        if not self.selected_geometries:
             return
         for geom in self.selected_geometries:
             self.selected_rubber_band.addGeometry(geom, None)
 
     def canvasMoveEvent(self, e):
-        if self.current_points is None:
+        if e is None or not self.current_points:
             return
-        self.current_rubber_update(self.toMapCoordinates(e.pos()))
-        self.last_pos = self.toMapCoordinates(e.pos())
+        map_pos = self.toMapCoordinates(e.pos())
+        self.current_rubber_update(map_pos)
+        self.last_pos = map_pos
 
     def keyPressEvent(self, e):
-        if e.key() == Qt.Key_Escape:
+        if e is None:
+            return
+        if e.key() == Qt.Key.Key_Escape:
             self.uc.bar_info("Tool aborted")
             self.selecting_finished()
-        elif e.key() == Qt.Key_Backspace:
+        elif e.key() == Qt.Key.Key_Backspace:
             if self.current_points:
                 self.current_points.pop()
             self.current_rubber_update(cur_position=self.last_pos if self.last_pos else None)
 
     def canvasReleaseEvent(self, e):
-        if e.button() == Qt.RightButton:
+        if e is None:
+            return
+        if e.button() == Qt.MouseButton.RightButton:
             modifiers = QApplication.keyboardModifiers()
-            if modifiers == Qt.ShiftModifier:
+            if modifiers == Qt.KeyboardModifier.ShiftModifier:
                 self.selection_mode = self.REMOVE_FROM_SELECTION
-            elif modifiers == Qt.ControlModifier:
+            elif modifiers == Qt.KeyboardModifier.ControlModifier:
                 self.selection_mode = self.ADD_TO_SELECTION
             else:
                 self.selection_mode = self.NEW_SELECTION
@@ -166,20 +176,17 @@ class RasterCellSelectionMapTool(QgsMapTool):
                 self.logger.debug(f"Right mouse button in mode: {self.selection_mode}")
             self.update_selection()
             return
-        if e.button() != Qt.LeftButton:
+        if e.button() != Qt.MouseButton.LeftButton:
             return
 
         cur_pos = self.toMapCoordinates(e.pos())
-        if self.current_points is None:
-            self.current_points = [cur_pos]
-        else:
-            self.current_points.append(cur_pos)
+        self.current_points.append(cur_pos)
         self.current_rubber_update(cur_position=cur_pos)
 
     def update_selection(self):
         if self.logger:
             self.logger.debug(f"Selection tool points: {[str(pt) for pt in self.current_points]}")
-        if self.current_points is None:
+        if not self.current_points:
             return
 
         new_geom = self.create_selecting_geometry()

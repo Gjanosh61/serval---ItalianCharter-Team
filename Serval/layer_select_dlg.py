@@ -9,13 +9,16 @@ from qgis.gui import QgsMapLayerComboBox
 
 class LayerSelectDialog(QDialog):
     def __init__(self, parent=None, title=""):
-        super(QDialog, self).__init__(parent)
+        super().__init__(parent)
 
         self.cbo = QgsMapLayerComboBox()
         self.cbo.setFilters(QgsMapLayerProxyModel.VectorLayer)
-        self.btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
         self.btns.accepted.connect(self.accept)
         self.btns.rejected.connect(self.reject)
+        
         lout = QVBoxLayout()
         lout.addWidget(self.cbo)
         lout.addWidget(self.btns)

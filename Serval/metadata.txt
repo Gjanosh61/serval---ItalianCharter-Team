@@ -1,9 +1,9 @@
 [general]
 name=Serval
 qgisMinimumVersion=3.10
-qgisMaximumVersion=3.99
+qgisMaximumVersion=4.99
 description=Raster editing tools
-version=3.32.0
+version=3.33.1
 author=Radoslaw Pasiok for Lutra Consulting Ltd.
 email=radek.pasiok@lutraconsulting.co.uk
 about=Raster editing tools - select and apply a modification to a chosen part of a raster. Features setting a constant value (also NoData), an expression (probing other rasters and interpolation on vector and mesh layers) and applying 3x3 low-pass filter. Multiband rasters are fully supported.
@@ -15,6 +15,11 @@ repository=https://github.com/lutraconsulting/serval
 # Uncomment the following line and add your changelog:
 
 changelog=
+        3.33.1 Improved Qt5/Qt6 and QGIS 3/4 compatibility.
+            * Improved robustness of raster selection tools and geometry handling.
+            * Refactored plugin state handling to avoid None-related runtime errors and static-analysis warnings.
+            * Hardened active raster lifecycle, undo/redo management, and NoData editing.
+            * Made multiband spinbox handling safer with better NoData/default value support.
         3.32.0 Added new raster type (Int8) to provider types
         3.10.5 Handle rasters with invalid path
         3.10.4 Fix for XYZ rasters and others non-GDAL providers

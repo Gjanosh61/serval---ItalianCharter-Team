@@ -1,8 +1,17 @@
-# Serval
+# Serval — User Manual
 
-Serval is a QGIS plugin for raster editing. 
+Serval is a QGIS plugin for raster editing.
+
+Recent versions of the plugin include internal improvements focused on better stability and compatibility with newer QGIS and Qt releases.
+Raster editing workflows have been hardened by adding additional checks for active layers, geometry validity and NoData handling.  
+Spatial index caching has also been improved to work reliably with multiple vector layers during expression-based raster updates.
+
+Serval allows editing raster values directly in the map canvas, using constant values, NoData assignment or values derived from
+QGIS expressions and external spatial layers.
+
 It provides convenient tools for modifying (small) raster parts and is _not_ intended to process entire images - 
 use Raster Calculator for this.
+
 Users can select some portions of a raster and apply one of the following modifications to selected cells:
 * set a constant value (including NODATA),
 * apply a QGIS expression value,
@@ -15,6 +24,11 @@ Raster cell selection tools include:
 * loading selection from a vector map layer.
 
 Multi-band rasters are fully supported - users can modify each band separately, or as RGB in case of 3/4-bands rasters.
+
+Band value widgets are now recreated dynamically when the active raster or band configuration changes.  
+This improves reliability when switching between single-band and multi-band rasters,
+especially in projects where rasters with different data types or NoData
+definitions are edited within the same session.
 
 Probing raster tool and drawing tool (changing single cell value) are also available.
 
@@ -94,7 +108,7 @@ Please note that for RGB bands active, the expression builder is not available a
 
 ### Pencil tool
 
-![Pencil tool](../icons/draw.svg) activates pencil, or drawing tool, used for changing single cell values.
+![Pencil tool](../icons/draw.svg) activates pencil, or drawing tool, used for changin single cell values.
 
 ### Apply constant value
 
@@ -104,6 +118,10 @@ Please note that for RGB bands active, the expression builder is not available a
 ### Apply NoData
 
 ![Apply NoData value](../icons/apply_nodata_value.svg) Applies NoData value to selected cells.
+
+Band value widgets are now recreated dynamically when the active raster or band configuration changes.  
+This improves reliability when switching between single-band and multi-band rasters,
+especially in projects where rasters with different data types or NoData definitions are edited within the same session.
 
 If NoData is not defined or need to be changed, see [Changing raster NoData value](#change-raster-nodata-value).
 
@@ -147,7 +165,8 @@ If NoData is found in one of neighboring cells, it is ignored.
 
 ![Undo](../icons/undo.svg) and ![Redo](../icons/redo.svg) buttons are used for undo and redo last operations.
 Number of undo steps to keep in memory is configurable. Default value is 3.
-
+Undo/redo management has been internally refactored to better track changes per raster layer.
+This reduces the risk of inconsistent states when switching between different rasters during an editing session.
 
 ### Change raster NoData value 
 
@@ -167,6 +186,20 @@ They are available from _Serval_ of the central widget of QGIS Expression Builde
 
 **Note**: When using them for raster modification, make sure that any vector or mesh layer used in the expression have the same
 coordinate system as the raster.
+
+Expression helper functions have been updated to improve spatial indexing performance and stability when working with multiple vector layers.
+Nearest-feature and interpolation functions now include additional geometry validity checks and improved handling of empty query results.
+
+Typical use cases include:
+
+- nearest feature attribute lookup
+- interpolation along line geometries
+- averaging attribute values of intersecting features
+- mesh dataset sampling
+
+These functions enable advanced raster editing workflows driven by
+external spatial datasets.
+
 
 
 ### Function `interpolate_from_mesh`
@@ -226,3 +259,19 @@ Syntax:
 Arguments:
 
 * `vlayer_id` - linestring vector layer id - get it from _Map Layers_ group
+
+
+## Editing considerations
+
+- Raster editing modifies the source dataset directly.
+- Ensure proper backups before large editing operations.
+- Performance depends on raster size, provider type and system memory.
+- Expression-based editing may require spatial indexes on vector layers for optimal performance.
+
+## Stability and compatibility notes
+
+Recent internal updates focused on improving plugin reliability in modern
+QGIS environments (QGIS 3.3x and QGIS 4 development versions).
+These changes do not modify user workflows but provide safer raster editing
+operations, improved handling of temporary layers and more predictable
+results when using expression-based raster modification tools.

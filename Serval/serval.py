@@ -93,8 +93,8 @@ class Serval(object):
         self.crs_transform = None
         self.all_touched = None
         self.selection_mode = None
-        self.spatial_index_time = dict()  # {layer_id: creation time}
-        self.spatial_index = dict()  # {layer_id: spatial index}
+        self.spatial_index_time = {}  # {layer_id: creation time}
+        self.spatial_index = {}       # {layer_id: QgsSpatialIndex}
         self.selection_layers_count = 1
         self.debug = DEBUG
         self.logger = get_logger() if self.debug else None
@@ -124,7 +124,8 @@ class Serval(object):
         self.map_tool_btn = dict()  # {map tool: button activating the tool}
 
         self.iface.currentLayerChanged.connect(self.set_active_raster)
-        self.project.layersAdded.connect(self.set_active_raster)
+        if self.project is not None:
+            self.project.layersAdded.connect(self.set_active_raster)
         self.canvas.mapToolSet.connect(self.check_active_tool)
 
         self.register_exp_functions()
@@ -183,7 +184,7 @@ class Serval(object):
         self.map_tool_btn[self.probe_tool] = self.probe_btn
 
         self.color_btn = QgsColorButton()
-        self.color_btn.setColor(Qt.gray)
+        self.color_btn.setColor(QColor(Qt.GlobalColor.gray))
         self.color_btn.setMinimumSize(QSize(40, 24))
         self.color_btn.setMaximumSize(QSize(40, 24))
         self.toolbar.addWidget(self.color_btn)
@@ -362,7 +363,7 @@ class Serval(object):
         return action
 
     def unload(self):
-        self.changes = None
+        self.changes.clear()
         if self.selection_tool:
             self.selection_tool.reset()
         if self.spin_boxes is not None:
@@ -424,36 +425,69 @@ class Serval(object):
         if not self.selection_tool.selected_geometries:
             self.uc.bar_warn("No selection for raster layer. Select some cells and retry...")
             return
-        self.handler.select(self.selection_tool.selected_geometries, all_touched_cells=self.all_touched)
-        self.handler.create_cell_pts_layer()
-        if self.handler.cell_pts_layer.featureCount() == 0:
+        handler = self.handler
+        if handler is None:
+            if self.logger:
+                self.logger.warning("Raster handler is not available")
+            return
+        all_touched = bool(self.all_touched)
+        handler.select(self.selection_tool.selected_geometries, all_touched_cells=all_touched)
+        handler.create_cell_pts_layer()
+
+        cell_pts_layer = handler.cell_pts_layer
+        if cell_pts_layer is None or cell_pts_layer.featureCount() == 0:
             self.uc.bar_warn("No selection for raster layer. Select some cells and retry...")
             return
-        self.exp_dlg = QgsExpressionBuilderDialog(self.handler.cell_pts_layer)
+        self.exp_dlg = QgsExpressionBuilderDialog(cell_pts_layer)
         self.exp_builder = self.exp_dlg.expressionBuilder()
         self.exp_dlg.accepted.connect(self.apply_exp_value)
         self.exp_dlg.show()
 
     def apply_exp_value(self):
-        if not self.exp_dlg.expressionText() or not self.exp_builder.isExpressionValid():
+        exp_dlg = self.exp_dlg
+        exp_builder = self.exp_builder
+        handler = self.handler
+        raster = self.raster
+
+        if exp_dlg is None or exp_builder is None or handler is None or raster is None:
+            if self.logger:
+                self.logger.warning("Expression dialog/builder, raster handler, or raster layer is not available")
             return
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        exp = self.exp_dlg.expressionText()
-        idx = self.handler.cell_pts_layer.addExpressionField(exp, QgsField('exp_val', QVariant.Double))
-        self.handler.exp_field_idx = idx
-        self.handler.write_block()
-        QApplication.restoreOverrideCursor()
-        self.raster.triggerRepaint()
+
+        if not exp_dlg.expressionText() or not exp_builder.isExpressionValid():
+            return
+        
+        cell_pts_layer = handler.cell_pts_layer
+        if cell_pts_layer is None:
+            if self.logger:
+                self.logger.warning("Cell points layer is not available")
+            return
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            exp = exp_dlg.expressionText()
+            idx = cell_pts_layer.addExpressionField(exp, QgsField('exp_val', QVariant.Double))
+            handler.exp_field_idx = idx
+            handler.write_block()
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        raster.triggerRepaint()
 
     def activate_drawing(self):
         self.mode = 'draw'
         self.canvas.setMapTool(self.draw_tool)
 
     def get_cur_line_width(self):
+        raster = self.raster
+        if raster is None:
+            if self.logger:
+                self.logger.warning("Active raster layer is not available")
+            return self.line_width_sbox.value()
         width_coef = {
-            "map units": 1.,
-            "pixel width": self.raster.rasterUnitsPerPixelX(),
-            "pixel height": self.raster.rasterUnitsPerPixelY(),
+            "map units": 1.0,
+            "pixel width": raster.rasterUnitsPerPixelX(),
+            "pixel height": raster.rasterUnitsPerPixelY(),
             "hairline": 0.000001,
         }
         return self.line_width_sbox.value() * width_coef[self.width_unit_cbo.currentText()]
@@ -483,45 +517,84 @@ class Serval(object):
             pass
 
     def apply_values(self, new_values):
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.handler.select(self.selection_tool.selected_geometries, all_touched_cells=self.all_touched)
-        self.handler.write_block(new_values)
-        QApplication.restoreOverrideCursor()
-        self.raster.triggerRepaint()
+        handler = self.handler
+        raster = self.raster
+        if handler is None or raster is None:
+            if self.logger:
+                self.logger.warning("Raster handler or active raster layer is not available")
+            return
+        all_touched = bool(self.all_touched)
+        
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            handler.select(self.selection_tool.selected_geometries, all_touched_cells=all_touched)
+            handler.write_block(new_values)
+        finally:
+            QApplication.restoreOverrideCursor()
+        raster.triggerRepaint()
 
     def apply_values_single_cell(self, new_vals):
         """Create single cell selection and apply the new values."""
+        handler = self.handler
+        raster = self.raster
         cp = self.last_point
+        if handler is None or raster is None:
+            if self.logger:
+                self.logger.warning("Raster handler or active raster layer is not available")
+            return
+
         if self.logger:
             self.logger.debug(f"Changing single cell for pt {cp}")
-        col, row = self.handler.point_to_index([cp.x(), cp.y()])
-        px, py = self.handler.index_to_point(row, col, upper_left=False)
+        col, row = handler.point_to_index([cp.x(), cp.y()])
+        px, py = handler.index_to_point(row, col, upper_left=False)
         d = 0.001
         bbox = QgsRectangle(px - d, py - d, px + d, py + d)
         if self.logger:
             self.logger.debug(f"Changing single cell in {bbox}")
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.handler.select([QgsGeometry.fromRect(bbox)], all_touched_cells=False, transform=False)
-        self.handler.write_block(new_vals)
-        QApplication.restoreOverrideCursor()
-        self.raster.triggerRepaint()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            handler.select([QgsGeometry.fromRect(bbox)], all_touched_cells=False, transform=False)
+            handler.write_block(new_vals)
+        finally:        
+            QApplication.restoreOverrideCursor()
+        raster.triggerRepaint()
 
     def apply_spin_box_values(self):
         if not self.selection_tool.selected_geometries:
             return
-        self.apply_values(self.spin_boxes.get_values())
+        spin_boxes = self.spin_boxes
+        if spin_boxes is None:
+            if self.logger:
+                self.logger.warning("Band spin boxes are not available")
+            return
+        self.apply_values(spin_boxes.get_values())
 
     def apply_nodata_value(self):
         if not self.selection_tool.selected_geometries:
             return
-        self.apply_values(self.handler.nodata_values)
+        handler = self.handler
+        if handler is None:
+            if self.logger:
+                self.logger.warning("Raster handler is not available")
+            return
+        self.apply_values(handler.nodata_values)
 
     def apply_low_pass_filter(self):
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        self.handler.select(self.selection_tool.selected_geometries, all_touched_cells=self.all_touched)
-        self.handler.write_block(low_pass_filter=True)
-        QApplication.restoreOverrideCursor()
-        self.raster.triggerRepaint()
+        handler = self.handler
+        raster = self.raster
+        if handler is None or raster is None:
+            if self.logger:
+                self.logger.warning("Raster handler or active raster layer in not available")
+            return
+        all_touched = bool(self.all_touched)
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            handler.select(self.selection_tool.selected_geometries, all_touched_cells=all_touched)
+            handler.write_block(low_pass_filter=True)
+        finally:
+            QApplication.restoreOverrideCursor()
+        raster.triggerRepaint()
 
     def clear_selection(self):
         if self.selection_tool:
@@ -529,11 +602,20 @@ class Serval(object):
 
     def selection_from_layer(self):
         """Create a new selection from layer."""
-        self.selection_tool.init_tool(self.raster, mode=self.POLYGON_SELECTION, line_width=self.get_cur_line_width())
+        raster = self.raster
+        if raster is None:
+            if self.logger:
+                self.logger.warning("Active raster layer is not available")
+            return
+        self.selection_tool.init_tool(raster, mode=self.POLYGON_SELECTION, line_width=self.get_cur_line_width())
         dlg = LayerSelectDialog()
-        if not dlg.exec_():
+        if not dlg.exec():
             return
         cur_layer = dlg.cbo.currentLayer()
+        if cur_layer is None:
+            if self.logger:
+                self.logger.warning("No layer selected in layer selection dialog")
+            return
         if not cur_layer.type() == QgsMapLayerType.VectorLayer:
             return
         self.selection_tool.selection_from_layer(cur_layer)
@@ -541,21 +623,32 @@ class Serval(object):
     def selection_to_layer(self):
         """Create a memory layer from current selection"""
         geoms = self.selection_tool.selected_geometries
-        if geoms is None or not self.raster:
+        raster = self.raster
+        project = self.project        
+        
+        if geoms is None or raster is None or project is None:
+            if self.logger:
+                self.logger.warning("Selection, raster, or project is not available")
             return
-        crs_str = self.raster.crs().toProj()
+        crs_str = raster.crs().toProj()
         nr = self.selection_layers_count
         self.selection_layers_count += 1
+        
         mlayer = QgsVectorLayer(f"Polygon?crs={crs_str}&field=fid:int", f"Raster selection {nr}", "memory")
-        fields = mlayer.dataProvider().fields()
+        provider = mlayer.dataProvider()
+        if provider is None:
+            if self.logger:
+                self.logger.warning("Memory layer data provider is not available")
+            return        
+        fields = provider.fields()        
         features = []
         for i, geom in enumerate(geoms):
             feat = QgsFeature(fields)
             feat["fid"] = i + 1
             feat.setGeometry(geom)
             features.append(feat)
-        mlayer.dataProvider().addFeatures(features)
-        self.project.addMapLayer(mlayer)
+        provider.addFeatures(features)
+        project.addMapLayer(mlayer)
 
     def toggle_all_touched(self):
         """Toggle selection mode."""
@@ -563,8 +656,18 @@ class Serval(object):
         self.all_touched = self.toggle_all_touched_btn.isChecked()
 
     def point_clicked(self, point=None, button=None):
-        if self.raster is None:
+        raster = self.raster
+        handler = self.handler
+        spin_boxes = self.spin_boxes
+        rbounds = self.rbounds
+        
+        if raster is None:
             self.uc.bar_warn("Choose a raster to work with...", dur=3)
+            return
+
+        if handler is None or spin_boxes is None or rbounds is None:
+            if self.logger:
+                self.logger.warning("Raster handler, band spin boxes, or raster bounds are not available")
             return
 
         if self.logger:
@@ -589,53 +692,71 @@ class Serval(object):
             self.logger.debug(f"Clicked point in raster CRS: {ptxy_in_src_crs}")
         self.last_point = ptxy_in_src_crs
 
-        ident_vals = self.handler.provider.identify(ptxy_in_src_crs, QgsRaster.IdentifyFormatValue).results()
-        cur_vals = list(ident_vals.values())
-
         # check if the point is within active raster extent
-        if not self.rbounds[0] <= ptxy_in_src_crs.x() <= self.rbounds[2]:
+        if not rbounds[0] <= ptxy_in_src_crs.x() <= rbounds[2]:
             self.uc.bar_info("Out of x bounds", dur=3)
             return
-        if not self.rbounds[1] <= ptxy_in_src_crs.y() <= self.rbounds[3]:
+        if not rbounds[1] <= ptxy_in_src_crs.y() <= rbounds[3]:
             self.uc.bar_info("Out of y bounds", dur=3)
             return
+        
+        ident_vals = handler.provider.identify(ptxy_in_src_crs, QgsRaster.IdentifyFormatValue).results()
+        cur_vals = list(ident_vals.values())
 
         if self.mode == 'draw':
-            new_vals = self.spin_boxes.get_values()
+            new_vals = spin_boxes.get_values()
             if self.logger:
                 self.logger.debug(f"Applying const value {new_vals}")
             self.apply_values_single_cell(new_vals)
         else:
-            self.spin_boxes.set_values(cur_vals)
-            if 2 < self.handler.bands_nr < 5:
+            spin_boxes.set_values(cur_vals)
+            if 2 < handler.bands_nr < 5:
                 self.color_picker_connection(connect=False)
-                self.color_btn.setColor(QColor(*self.spin_boxes.get_values()[:4]))
+                self.color_btn.setColor(QColor(*spin_boxes.get_values()[:4]))
                 self.color_picker_connection(connect=True)
 
     def set_values_from_picker(self, c):
         """Set bands spinboxes values after color change in the color picker"""
+        handler = self.handler
+        spin_boxes = self.spin_boxes
+        
+        if handler is None or spin_boxes is None:
+            if self.logger:
+                self.logger.warning("Raster handler or band spin boxes are not available")
+            return
+        
         values = None
-        if self.handler.bands_nr > 2:
+        if handler.bands_nr > 2:
             values = [c.red(), c.green(), c.blue()]
-            if self.handler.bands_nr == 4:
+            if handler.bands_nr == 4:
                 values.append(c.alpha())
         if values:
-            self.spin_boxes.set_values(values)
+            spin_boxes.set_values(values)
 
     def set_nodata(self):
         """Set NoData value(s) for each band of current raster."""
-        if not self.raster:
+        raster = self.raster
+        handler = self.handler
+
+        if raster is None:
             self.uc.bar_warn('Select a raster layer to define/change NoData value!')
             return
-        if self.handler.provider.userNoDataValues(1):
+        if handler is None:
+            if self.logger:
+                self.logger.warning("Raster handler is not available")
+            return
+
+        provider = handler.provider
+
+        if provider.userNoDataValues(1):
             note = '\nNote: there is a user defined NODATA value.\nCheck the raster properties (Transparency).'
         else:
             note = ''
-        dt = self.handler.provider.dataType(1)
-        
+        dt = provider.dataType(1)
+
         # current NODATA value
-        if self.handler.provider.sourceHasNoDataValue(1):
-            cur_nodata = self.handler.provider.sourceNoDataValue(1)
+        if provider.sourceHasNoDataValue(1):
+            cur_nodata = provider.sourceNoDataValue(1)
             if dt < 6:
                 cur_nodata = '{0:d}'.format(int(float(cur_nodata)))
         else:
@@ -643,7 +764,7 @@ class Serval(object):
         
         label = 'Define/change raster NODATA value.\n\n'
         label += 'Raster src_data type: {}.{}'.format(dtypes[dt]['name'], note)
-        nd, ok = QInputDialog.getText(None, "Define NODATA Value", label, QLineEdit.Normal, str(cur_nodata))
+        nd, ok = QInputDialog.getText(None, "Define NODATA Value", label, QLineEdit.EchoMode.Normal, str(cur_nodata))
         if not ok:
             return
         if not is_number(nd):
@@ -653,9 +774,9 @@ class Serval(object):
         
         # set the NODATA value for each band
         res = []
-        for nr in self.handler.bands_range:
-            res.append(self.handler.provider.setNoDataValue(nr, new_nodata))
-            self.handler.provider.sourceHasNoDataValue(nr)
+        for nr in handler.bands_range:
+            res.append(provider.setNoDataValue(nr, new_nodata))
+            provider.sourceHasNoDataValue(nr)
         
         if False in res:
             self.uc.show_warn('Setting new NODATA value failed!')
@@ -663,15 +784,24 @@ class Serval(object):
             self.uc.bar_info('Successful setting new NODATA values!', dur=2)
 
         self.set_active_raster()
-        self.raster.triggerRepaint()
+        if self.raster is not None:
+            self.raster.triggerRepaint()
         
     def check_undo_redo_btns(self):
         """Enable/Disable undo and redo buttons based on availability of undo/redo for current raster."""
         self.undo_btn.setDisabled(True)
         self.redo_btn.setDisabled(True)
-        if self.raster is None or self.raster.id() not in self.changes:
+        
+        raster = self.raster
+        changes_map = self.changes
+        
+        if raster is None:
             return
-        changes = self.changes[self.raster.id()]
+        raster_id = raster.id()
+        changes = changes_map.get(raster_id)
+        if changes is None:
+            return
+        
         if changes.nr_undos() > 0:
             self.undo_btn.setEnabled(True)
         if changes.nr_redos() > 0:
@@ -679,11 +809,15 @@ class Serval(object):
 
     def enable_toolbar_actions(self, enable=True):
         """Enable / disable all toolbar actions but Help (for vectors and unsupported rasters)"""
-        for widget in self.actions + [self.width_unit_cbo, self.line_width_sbox]:
+        actions = self.actions
+        always_on = self.actions_always_on
+        for widget in actions + [self.width_unit_cbo, self.line_width_sbox]:
             widget.setEnabled(enable)
-            if widget in self.actions_always_on:
+            if widget in always_on:
                 widget.setEnabled(True)
-        self.spin_boxes.enable(enable)
+        spin_boxes = self.spin_boxes
+        if spin_boxes is not None:
+            spin_boxes.enable(enable)
 
     @staticmethod
     def check_layer(layer):
@@ -705,53 +839,99 @@ class Serval(object):
             return False
 
     def set_bands_cbo(self):
+        handler = self.handler
+        if handler is None:
+            if self.logger:
+                self.logger.warning("Raster handler is not available")
+            return
         self.bands_cbo.currentIndexChanged.disconnect(self.update_active_bands)
         self.bands_cbo.clear()
-        for band in self.handler.bands_range:
+        for band in handler.bands_range:
             self.bands_cbo.addItem(f"{band}", [band])
-        if self.handler.bands_nr > 1:
+        if handler.bands_nr > 1:
             self.bands_cbo.addItem(self.RGB, [1, 2, 3])
         self.bands_cbo.setCurrentIndex(0)
         self.bands_cbo.currentIndexChanged.connect(self.update_active_bands)
 
     def update_active_bands(self, idx):
+        handler = self.handler
+        spin_boxes = self.spin_boxes
+        if handler is None or spin_boxes is None:
+            if self.logger:
+                self.logger.warning("Raster handler or band spin boxes are not available")
+            return
+        
         bands = self.bands_cbo.currentData()
-        self.handler.active_bands = bands
-        self.spin_boxes.create_spinboxes(bands, self.handler.data_types, self.handler.nodata_values)
+        if bands is None:
+            if self.logger:
+                self.logger.warning("No active bands selected")
+            return
+        handler.active_bands = bands
+        spin_boxes.create_spinboxes(bands, handler.data_types, handler.nodata_values)
         self.color_btn.setEnabled(len(bands) > 1)
         self.exp_dlg_btn.setEnabled(len(bands) == 1)
 
     def set_active_raster(self):
         """Active layer has changed - check if it is a raster layer and prepare it for the plugin"""
-        old_spin_boxes_values = self.spin_boxes.get_values()
+        spin_boxes = self.spin_boxes
+        project = self.project
+        changes_map = self.changes
+
+        if changes_map is None:
+            if self.logger:
+                self.logger.warning("Raster changes map is not available")
+            return
+        
+        old_spin_boxes_values = spin_boxes.get_values() if spin_boxes is not None else []
         self.crs_transform = None
         layer = self.iface.activeLayer()
+
         if self.check_layer(layer):
             self.raster = layer
-            self.crs_transform = None if self.project.crs() == self.raster.crs() else \
-                QgsCoordinateTransform(self.project.crs(), self.raster.crs(), self.project)
-            self.handler = RasterHandler(self.raster, self.uc, self.debug)
-            supported, unsupported_type = self.handler.write_supported()
+            raster = self.raster
+            
+            if raster is None:
+                self.enable_toolbar_actions(enable=False)
+                self.reset_raster()
+                self.check_undo_redo_btns()
+                return
+
+            if project is None:
+                if self.logger:
+                    self.logger.warning("Project instance is not available")
+                self.enable_toolbar_actions(enable=False)
+                self.reset_raster()
+                self.check_undo_redo_btns()
+                return
+            
+            self.crs_transform = (None if project.crs() == raster.crs() else QgsCoordinateTransform(project.crs(), raster.crs(), project)) 
+            handler = RasterHandler(raster, self.uc, self.debug)
+            self.handler = handler            
+            supported, unsupported_type = handler.write_supported()
             if supported:
                 self.enable_toolbar_actions()
-                self.set_bands_cbo()
-                self.spin_boxes.create_spinboxes(self.handler.active_bands,
-                                                 self.handler.data_types, self.handler.nodata_values)
-                if self.handler.bands_nr == len(old_spin_boxes_values):
-                    self.spin_boxes.set_values(old_spin_boxes_values)
-                self.bands_cbo.setEnabled(self.handler.bands_nr > 1)
-                self.color_btn.setEnabled(len(self.handler.active_bands) > 1)
-                self.rbounds = self.raster.extent().toRectF().getCoords()
-                self.handler.raster_changed.connect(self.add_to_undo)
-                if self.raster.id() not in self.changes:
-                    self.changes[self.raster.id()] = RasterChanges(nr_to_keep=self.settings["undo_steps"])
+                self.set_bands_cbo()                
+                spin_boxes = self.spin_boxes
+                if spin_boxes is not None:
+                    spin_boxes.create_spinboxes(handler.active_bands, handler.data_types, handler.nodata_values)
+                    if handler.bands_nr == len(old_spin_boxes_values):
+                        spin_boxes.set_values(old_spin_boxes_values)
+                elif self.logger:
+                    self.logger.warning("Band spin boxes are not available")
+                self.bands_cbo.setEnabled(handler.bands_nr > 1)
+                self.color_btn.setEnabled(len(handler.active_bands) > 1)
+                self.rbounds = raster.extent().toRectF().getCoords()
+                handler.raster_changed.connect(self.add_to_undo)
+
+                raster_id = raster.id()
+                if changes_map.get(raster_id) is None:
+                    changes_map[raster_id] = RasterChanges(nr_to_keep=self.settings["undo_steps"])            
             else:
                 msg = f"The raster has unsupported src_data type: {unsupported_type}"
                 msg += "\nServal can't work with it, sorry..."
                 self.uc.show_warn(msg)
                 self.enable_toolbar_actions(enable=False)
                 self.reset_raster()
-        
         else:
             # unsupported raster
             self.enable_toolbar_actions(enable=False)
@@ -761,29 +941,81 @@ class Serval(object):
 
     def add_to_undo(self, change):
         """Add the old and new blocks to undo stack."""
-        self.changes[self.raster.id()].add_change(change)
-        self.check_undo_redo_btns()
+        raster = self.raster
+        changes_map = self.changes
+        if raster is None or changes_map is None:
+            if self.logger:
+                self.logger.warning("Raster or changes map is not available")
+            return
+        raster_changes = changes_map.get(raster.id())
+        if raster_changes is None:
+            if self.logger:
+                self.logger.warning("No undo stack found for current raster")
+            return
+        raster_changes.add_change(change)
+        self.check_undo_redo_btns()        
         if self.logger:
             self.logger.debug(self.get_undo_redo_values())
 
     def get_undo_redo_values(self):
-        changes = self.changes[self.raster.id()]
+        raster = self.raster
+        changes_map = self.changes
+        
+        if raster is None or changes_map is None:
+            return "nr undos: 0, redos: 0"
+            
+        changes = changes_map.get(raster.id())
+        if changes is None:
+            return "nr undos: 0, redos: 0"
         return f"nr undos: {changes.nr_undos()}, redos: {changes.nr_redos()}"
 
     def undo(self):
-        undo_data = self.changes[self.raster.id()].undo()
-        self.handler.write_block_undo(undo_data)
-        self.raster.triggerRepaint()
+        raster = self.raster
+        handler = self.handler
+        changes_map = self.changes
+
+        if raster is None or handler is None or changes_map is None:
+            if self.logger:
+                self.logger.warning("Raster, handler or changes map is not available")
+            return
+
+        raster_changes = changes_map.get(raster.id())
+        if raster_changes is None:
+            if self.logger:
+                self.logger.warning("No undo stack found for current raster")
+            return
+
+        undo_data = raster_changes.undo()
+        handler.write_block_undo(undo_data)
+        raster.triggerRepaint()
         self.check_undo_redo_btns()
 
     def redo(self):
-        redo_data = self.changes[self.raster.id()].redo()
-        self.handler.write_block_undo(redo_data)
-        self.raster.triggerRepaint()
+        raster = self.raster
+        handler = self.handler
+        changes_map = self.changes
+
+        if raster is None or handler is None or changes_map is None:
+            if self.logger:
+                self.logger.warning("Raster, handler or changes map is not available")
+            return
+
+        raster_changes = changes_map.get(raster.id())
+        if raster_changes is None:
+            if self.logger:
+                self.logger.warning("No redo stack found for current raster")
+            return
+
+        redo_data = raster_changes.redo()
+        handler.write_block_undo(redo_data)
+        raster.triggerRepaint()
         self.check_undo_redo_btns()
 
     def reset_raster(self):
         self.raster = None
+        self.handler = None
+        self.rbounds = None
+        self.crs_transform = None
         self.color_btn.setDisabled(True)
 
     def color_picker_connection(self, connect=True):
@@ -798,76 +1030,201 @@ class Serval(object):
 
     def recreate_spatial_index(self, layer):
         """Check if spatial index exists for the layer and if it is relatively old and eventually recreate it."""
-        ctime = self.spatial_index_time[layer.id()] if layer.id() in self.spatial_index_time else None
+        layer_id = layer.id()
+        ctime = self.spatial_index_time.get(layer_id)
         if ctime is None or datetime.now() - ctime > timedelta(seconds=30):
-            self.spatial_index = QgsSpatialIndex(layer.getFeatures(), None, QgsSpatialIndex.FlagStoreFeatureGeometries)
-            self.spatial_index_time[layer.id()] = datetime.now()
+            self.spatial_index[layer_id] = QgsSpatialIndex(layer.getFeatures(), None, QgsSpatialIndex.FlagStoreFeatureGeometries)
+            self.spatial_index_time[layer_id] = datetime.now()
 
     def get_nearest_feature(self, pt_feat, vlayer_id):
         """Given the point feature, return nearest feature from vlayer."""
-        vlayer = self.project.mapLayer(vlayer_id)
+        project = self.project
+        if project is None:
+            if self.logger:
+                self.logger.warning("Project instance is not available")
+            return None
+
+        vlayer = project.mapLayer(vlayer_id)
+        if vlayer is None:
+            if self.logger:
+                self.logger.warning(f"Vector layer not found: {vlayer_id}")
+            return None
+
         self.recreate_spatial_index(vlayer)
-        ptxy = pt_feat.geometry().asPoint()
-        near_fid = self.spatial_index.nearestNeighbor(ptxy)[0]
+
+        spatial_indexes = self.spatial_index
+        spatial_index = spatial_indexes.get(vlayer.id())
+        if spatial_index is None:
+            if self.logger:
+                self.logger.warning(f"Spatial index is not available for layer '{vlayer.id()}'")
+            return None
+
+        pt_geom = pt_feat.geometry()
+        if pt_geom is None or pt_geom.isEmpty():
+            if self.logger:
+                self.logger.warning("Point feature has no valid geometry")
+            return None        
+        
+        ptxy = pt_geom.asPoint()
+        nearest = spatial_index.nearestNeighbor(ptxy)
+        if not nearest:
+            if self.logger:
+                self.logger.warning("No nearest feature found")
+            return None
+
+        near_fid = nearest[0]
         return vlayer.getFeature(near_fid)
 
     def nearest_feature_attr_value(self, pt_feat, vlayer_id, attr_name):
         """Find nearest feature to pt_feat and return its attr_name attribute value."""
         near_feat = self.get_nearest_feature(pt_feat, vlayer_id)
+        if near_feat is None:
+            if self.logger:
+                self.logger.warning(
+                    f"Nearest feature not found for layer '{vlayer_id}' and attribute '{attr_name}'")
+            return None
         return near_feat[attr_name]
 
     def nearest_pt_on_line_interpolate_z(self, pt_feat, vlayer_id):
         """Find nearest line feature to pt_feat and interpolate z value from vertices."""
         near_feat = self.get_nearest_feature(pt_feat, vlayer_id)
+        if near_feat is None:
+            if self.logger:
+                self.logger.warning(f"Nearest line feature not found for layer '{vlayer_id}'")
+            return None
+
         near_geom = near_feat.geometry()
-        closest_pt_dist = near_geom.lineLocatePoint(pt_feat.geometry())
+        if near_geom is None or near_geom.isEmpty():
+            if self.logger:
+                self.logger.warning(f"Nearest feature has no valid geometry for layer '{vlayer_id}'")
+            return None
+
+        pt_geom = pt_feat.geometry()
+        if pt_geom is None or pt_geom.isEmpty():
+            if self.logger:
+                self.logger.warning("Point feature has no valid geometry")
+            return None
+        closest_pt_dist = near_geom.lineLocatePoint(pt_geom)
         closest_pt = near_geom.interpolate(closest_pt_dist)
-        return closest_pt.get().z()
+        closest_pt_geom = closest_pt.get()
+        if closest_pt_geom is None:
+            if self.logger:
+                self.logger.warning("Interpolated closest point geometry is not available")
+            return None
+
+        return closest_pt_geom.z()
 
     def intersecting_features_attr_average(self, pt_feat, vlayer_id, attr_name, only_center):
         """
         Find all features intersecting current feature (cell center, or raster cell polygon) and calculate average
         value of their attr_name attribute.
         """
-        vlayer = self.project.mapLayer(vlayer_id)
+        project = self.project
+        handler = self.handler
+
+        if project is None or handler is None:
+            if self.logger:
+                self.logger.warning("Project instance or raster handler is not available")
+            return None
+
+        vlayer = project.mapLayer(vlayer_id)
+        if vlayer is None:
+            if self.logger:
+                self.logger.warning(f"Vector layer not found: {vlayer_id}")
+            return None
+
         self.recreate_spatial_index(vlayer)
-        ptxy = pt_feat.geometry().asPoint()
+
+        spatial_indexes = self.spatial_index
+        spatial_index = spatial_indexes.get(vlayer.id())
+        if spatial_index is None:
+            if self.logger:
+                self.logger.warning(f"Spatial index is not available for layer '{vlayer.id()}'")
+            return None
+
+        pt_geom = pt_feat.geometry()
+        if pt_geom is None or pt_geom.isEmpty():
+            if self.logger:
+                self.logger.warning("Point feature has no valid geometry")
+            return None
+        ptxy = pt_geom.asPoint()
         pt_x, pt_y = ptxy.x(), ptxy.y()
         dxy = 0.001
-        half_pix_x = self.handler.pixel_size_x / 2.
-        half_pix_y = self.handler.pixel_size_y / 2.
+        half_pix_x = handler.pixel_size_x / 2.0
+        half_pix_y = handler.pixel_size_y / 2.0
+
         if only_center:
             cell = QgsRectangle(pt_x, pt_y, pt_x + dxy, pt_y + dxy)
         else:
-            cell = QgsRectangle(pt_x - half_pix_x, pt_y - half_pix_y,
-                                pt_x + half_pix_x, pt_y + half_pix_y)
-        inter_fids = self.spatial_index.intersects(cell)
+            cell = QgsRectangle(
+                pt_x - half_pix_x,
+                pt_y - half_pix_y,
+                pt_x + half_pix_x,
+                pt_y + half_pix_y,
+            )
+
+        inter_fids = spatial_index.intersects(cell)
         values = []
+
         for fid in inter_fids:
             feat = vlayer.getFeature(fid)
-            if not feat.geometry().intersects(cell):
+            feat_geom = feat.geometry()
+            if feat_geom is None or not feat_geom.intersects(cell):
                 continue
+
             val = feat[attr_name]
             if not is_number(val):
                 continue
+
             values.append(val)
-        if len(values) == 0:
+
+        if not values:
             return None
+
         return sum(values) / float(len(values))
 
     def interpolate_from_mesh(self, pt_feat, mesh_layer_id, group, dataset, above_existing):
         """Interpolate from mesh."""
-        mesh_layer = self.project.mapLayer(mesh_layer_id)
-        ptxy = pt_feat.geometry().asPoint()
+        project = self.project
+        handler = self.handler
+
+        if project is None or handler is None:
+            if self.logger:
+                self.logger.warning("Project instance or raster handler is not available")
+            return None
+
+        mesh_layer = project.mapLayer(mesh_layer_id)
+        if mesh_layer is None:
+            if self.logger:
+                self.logger.warning(f"Mesh layer not found: {mesh_layer_id}")
+            return None
+
+        pt_geom = pt_feat.geometry()
+        if pt_geom is None or pt_geom.isEmpty():
+            if self.logger:
+                self.logger.warning("Point feature has no valid geometry")
+            return None
+
+        ptxy = pt_geom.asPoint()
         dataset_val = mesh_layer.datasetValue(QgsMeshDatasetIndex(group, dataset), ptxy)
         val = dataset_val.scalar()
+
         if math.isnan(val):
             return val
+
         if above_existing:
-            ident_vals = self.handler.provider.identify(ptxy, QgsRaster.IdentifyFormatValue).results()
-            org_val = list(ident_vals.values())[0]
-            if org_val == self.handler.nodata_values[0]:
+            ident_vals = handler.provider.identify(ptxy, QgsRaster.IdentifyFormatValue).results()
+            if not ident_vals:
                 return val
+
+            nodata_values = handler.nodata_values
+            if not nodata_values:
+                return val
+
+            org_val = list(ident_vals.values())[0]
+            if org_val == nodata_values[0]:
+                return val
+
             return max(org_val, val)
-        else:
-            return val
+
+        return val
